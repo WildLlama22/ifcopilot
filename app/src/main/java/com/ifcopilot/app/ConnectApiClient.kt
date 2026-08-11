@@ -13,16 +13,6 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/**
- * Client for Infinite Flight's "Connect" API v2 (local TCP socket, no API key).
- *
- * IMPORTANT CAVEAT: Infinite Flight's official docs describe the message shape
- * (ID, boolean, value; strings length-prefixed) but do not publish the exact
- * endianness used on the wire. This implementation assumes little-endian,
- * matching how the reference .NET sample (BitConverter, little-endian on all
- * common desktop/mobile CPUs) would naturally serialize values. If values come
- * back garbled, this is the first thing to flip (see ENDIAN below).
- */
 object Proto {
     val ENDIAN: ByteOrder = ByteOrder.LITTLE_ENDIAN
 }
@@ -30,7 +20,7 @@ object Proto {
 enum class IfType(val id: Int) {
     BOOL(0), INT(1), FLOAT(2), DOUBLE(3), STRING(4), LONG(5);
     companion object {
-        fun fromId(id: Int) = entries.first { it.id == id }
+        fun fromId(id: Int): IfType? = entries.firstOrNull { it.id == id }
     }
 }
 
@@ -77,15 +67,12 @@ class ConnectApiClient {
         private set
     var manifestById: Map<Int, ManifestEntry> = emptyMap()
         private set
+    var lastSkippedUnknownTypeCount: Int = 0
+        private set
 
     val isConnected: Boolean
         get() = socket?.isConnected == true && socket?.isClosed == false
 
-    /**
-     * Listens for the UDP broadcast Infinite Flight sends on port 15000
-     * advertising its host/port/aircraft. Returns null if nothing heard
-     * within [timeoutMs].
-     */
     suspend fun discover(timeoutMs: Int = 8000): DiscoveredHost? = withContext(Dispatchers.IO) {
         try {
             DatagramSocket(15000).use { udp ->
@@ -103,7 +90,6 @@ class ConnectApiClient {
     }
 
     private fun parseDiscovery(text: String): DiscoveredHost? {
-        // IF broadcasts a loosely-JSON-like structure; normalize single quotes/format
         return try {
             val json = JSONObject(text)
             val port = json.optInt("Port", 10112)
@@ -133,7 +119,6 @@ class ConnectApiClient {
         output = null
     }
 
-    /** Requests the full state manifest and builds path/id lookup maps. */
     private suspend fun fetchManifest() = ioMutex.withLock {
         val out = output ?: return@withLock
         val inp = input ?: return@withLock
@@ -142,7 +127,7 @@ class ConnectApiClient {
         writeBool(out, false)
         out.flush()
 
-        val respId = readInt32(inp)
+        readInt32(inp)
         val length = readInt32(inp)
         val raw = ByteArray(length)
         inp.readFully(raw)
@@ -150,6 +135,7 @@ class ConnectApiClient {
 
         val entries = mutableMapOf<String, ManifestEntry>()
         val entriesById = mutableMapOf<Int, ManifestEntry>()
+        var skippedUnknownTypes = 0
         text.split("\n").forEach { line ->
             if (line.isBlank()) return@forEach
             val parts = line.split(",", limit = 3)
@@ -157,16 +143,21 @@ class ConnectApiClient {
                 val id = parts[0].toIntOrNull() ?: return@forEach
                 val typeId = parts[1].toIntOrNull() ?: return@forEach
                 val path = parts[2]
-                val entry = ManifestEntry(id, IfType.fromId(typeId), path)
+                val type = IfType.fromId(typeId)
+                if (type == null) {
+                    skippedUnknownTypes++
+                    return@forEach
+                }
+                val entry = ManifestEntry(id, type, path)
                 entries[path] = entry
                 entriesById[id] = entry
             }
         }
         manifestByPath = entries
         manifestById = entriesById
+        lastSkippedUnknownTypeCount = skippedUnknownTypes
     }
 
-    /** Look up a manifest entry by its stable path string, e.g. "aircraft/0/altitude_agl" */
     fun resolve(path: String): ManifestEntry? = manifestByPath[path]
 
     suspend fun getState(entry: ManifestEntry): IfValue? = ioMutex.withLock {
@@ -202,15 +193,12 @@ class ConnectApiClient {
         out.flush()
     }
 
-    /** Runs a command entry (e.g. Commands.FlapsDown) - fire and forget. */
     suspend fun runCommand(entry: ManifestEntry) = ioMutex.withLock {
         val out = output ?: return@withLock
         writeInt32(out, entry.id)
         writeBool(out, false)
         out.flush()
     }
-
-    // ---- low level read/write helpers ----
 
     private fun writeInt32(out: DataOutputStream, v: Int) {
         val bb = ByteBuffer.allocate(4).order(Proto.ENDIAN).putInt(v)
@@ -233,8 +221,7 @@ class ConnectApiClient {
     }
 
     private fun readValue(inp: DataInputStream, expectedType: IfType): IfValue {
-        // Every response begins with id (int32) + length (int32) of the payload.
-        readInt32(inp) // id (echoed back), unused here
+        readInt32(inp)
         val length = readInt32(inp)
         val payload = ByteArray(length)
         inp.readFully(payload)
