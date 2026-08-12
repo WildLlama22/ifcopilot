@@ -33,6 +33,17 @@ class FlightMonitorService : Service() {
         var lastOnGround: Boolean = true
         var connected: Boolean = false
         var lastTogaError: String? = null
+
+        // Exposed so the UI's TOGA button runs on the service's own
+        // long-lived scope instead of a throwaway one tied to nothing -
+        // an orphan scope with no owner was the source of spurious
+        // "coroutine was cancelled" failures.
+        var sharedScope: CoroutineScope? = null
+
+        fun engageToga(onDone: (() -> Unit)? = null) {
+            val scope = sharedScope ?: return
+            toga?.engage(scope = scope, targetFraction = 0.95f, durationMs = 3000L, onDone = onDone)
+        }
     }
 
     data class FeatureFlags(
@@ -68,6 +79,7 @@ class FlightMonitorService : Service() {
         createNotificationChannel()
         callouts = CalloutEngine(this, serviceScope)
         toga = TogaController(client)
+        sharedScope = serviceScope
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

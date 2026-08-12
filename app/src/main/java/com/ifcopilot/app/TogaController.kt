@@ -52,6 +52,10 @@ class TogaController(private val client: ConnectApiClient) {
                     client.setStateFloat(throttleEntry, value.coerceIn(0f, 1f))
                     delay(stepDelay)
                 }
+            } catch (e: CancellationException) {
+                // Normal cancellation (e.g. re-pressing TOGA cancels the
+                // previous ramp) - not a real failure, don't report it as one.
+                throw e
             } catch (e: Exception) {
                 FlightMonitorService.lastTogaError = "TOGA failed: ${e.message ?: e.javaClass.simpleName}"
             }

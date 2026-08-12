@@ -20,6 +20,23 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+data class DiagCheckDef(val label: String, val exactPath: String, val searchKeyword: String)
+data class DiagResult(val label: String, val path: String, val found: Boolean, val suggestions: List<String>)
+
+val DIAG_CHECKS = listOf(
+    DiagCheckDef("Altitude AGL", "aircraft/0/altitude_agl", "agl"),
+    DiagCheckDef("Indicated airspeed", "aircraft/0/indicated_airspeed", "airspeed"),
+    DiagCheckDef("On ground", "aircraft/0/is_on_ground", "ground"),
+    DiagCheckDef("Gear lever", "aircraft/0/systems/landing_gear/lever_state", "gear"),
+    DiagCheckDef("Flap state", "aircraft/0/systems/flaps/state", "flap"),
+    DiagCheckDef("Wind direction", "environment/wind_direction_true", "wind_direction"),
+    DiagCheckDef("Wind speed", "environment/wind_velocity", "wind_velocity"),
+    DiagCheckDef("Heading", "aircraft/0/heading_true", "heading"),
+    DiagCheckDef("Vertical speed", "aircraft/0/vertical_speed", "vertical_speed"),
+    DiagCheckDef("Aircraft name", "aircraft/0/name", "name"),
+    DiagCheckDef("Throttle", "simulator/throttle", "throttle"),
+)
+
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,6 +66,7 @@ fun CopilotScreen() {
     var statusText by remember { mutableStateOf("Not connected") }
     var selectedProfile by remember { mutableStateOf(AircraftProfiles.GENERIC) }
     var togaEngaged by remember { mutableStateOf(false) }
+    var diagnostics by remember { mutableStateOf<List<DiagResult>>(emptyList()) }
 
     var altAgl by remember { mutableStateOf(0.0) }
     var ias by remember { mutableStateOf(0.0) }
@@ -143,6 +161,16 @@ fun CopilotScreen() {
                                 FlightMonitorService.currentProfile = selectedProfile
                                 val skippedNote = if (skipped > 0) " ($skipped manifest entries had an unrecognized type and were skipped)" else ""
                                 statusText = "Connected — detected: ${name.ifBlank { "unknown" }} → using ${selectedProfile.displayName} profile$skippedNote"
+
+                                // Build diagnostics: which state paths this app
+                                // depends on actually exist under the assumed
+                                // name, with fuzzy suggestions for any that don't.
+                                val client = FlightMonitorService.client
+                                diagnostics = DIAG_CHECKS.map { check ->
+                                    val found = client.resolve(check.exactPath) != null
+                                    val suggestions = if (found) emptyList() else client.searchPaths(check.searchKeyword)
+                                    DiagResult(check.label, check.exactPath, found, suggestions)
+                                }
                             } catch (e: Exception) {
                                 statusText = "Connection failed: ${e.message}"
                             }
@@ -151,6 +179,34 @@ fun CopilotScreen() {
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Connect")
+                }
+            }
+        }
+
+        if (diagnostics.isNotEmpty()) {
+            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Diagnostics: state paths this app depends on", fontWeight = FontWeight.Bold)
+                    Text(
+                        "These path names were guessed, not confirmed against your sim. " +
+                            "Anything marked ✗ is why a related feature won't work — the " +
+                            "suggestions are the closest real matches found in your sim's manifest.",
+                        fontSize = 12.sp
+                    )
+                    diagnostics.forEach { d ->
+                        Column(Modifier.padding(top = 4.dp)) {
+                            Text(
+                                "${if (d.found) "✓" else "✗"} ${d.label} — ${d.path}",
+                                fontSize = 13.sp,
+                                color = if (d.found) androidx.compose.ui.graphics.Color(0xFF2E7D32) else androidx.compose.ui.graphics.Color.Red
+                            )
+                            if (!d.found && d.suggestions.isNotEmpty()) {
+                                Text("  possible matches: ${d.suggestions.joinToString(", ")}", fontSize = 11.sp)
+                            } else if (!d.found) {
+                                Text("  no close match found in manifest either", fontSize = 11.sp)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -200,10 +256,7 @@ fun CopilotScreen() {
                     onClick = {
                         togaEngaged = true
                         togaError = null
-                        FlightMonitorService.toga?.engage(
-                            scope = CoroutineScope(Dispatchers.IO),
-                            targetFraction = 0.95f,
-                            durationMs = 3000L,
+                        FlightMonitorService.engageToga(
                             onDone = {
                                 togaEngaged = false
                                 togaError = FlightMonitorService.lastTogaError

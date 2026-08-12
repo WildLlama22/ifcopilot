@@ -224,6 +224,12 @@ class ConnectApiClient {
         }?.value
     }
 
+    /** Returns manifest paths containing the given keyword, for diagnostics/suggestions. */
+    fun searchPaths(keyword: String, limit: Int = 5): List<String> {
+        val lower = keyword.lowercase()
+        return manifestByPath.keys.filter { it.lowercase().contains(lower) }.sorted().take(limit)
+    }
+
     suspend fun getState(entry: ManifestEntry): IfValue? = ioMutex.withLock {
         val out = output ?: return@withLock null
         val inp = input ?: return@withLock null
