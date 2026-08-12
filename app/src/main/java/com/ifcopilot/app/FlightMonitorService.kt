@@ -32,6 +32,7 @@ class FlightMonitorService : Service() {
         var lastFlapState: Int = 0
         var lastOnGround: Boolean = true
         var connected: Boolean = false
+        var lastTogaError: String? = null
     }
 
     data class FeatureFlags(
@@ -54,6 +55,7 @@ class FlightMonitorService : Service() {
     private var lastGearLeverDown = true
     private var lastFlapIndex = -1
     private var lastGearWarnAt = 0L
+    private var hasBaseline = false
 
     // Windshear tracking: rolling headwind samples keyed by AGL band during
     // approach (50-1300ft) and shortly after rotation.
@@ -95,6 +97,7 @@ class FlightMonitorService : Service() {
 
     private fun startPolling() {
         pollJob?.cancel()
+        hasBaseline = false
         pollJob = serviceScope.launch {
             while (isActive) {
                 try {
@@ -128,6 +131,29 @@ class FlightMonitorService : Service() {
         lastGearDown = gearDown
         lastFlapState = flapState
         lastOnGround = onGround
+
+        // First sample after (re)connecting: just record the current state
+        // as the baseline, don't evaluate any transitions against it. Without
+        // this, wasOnGround's default (true) makes an already-airborne
+        // aircraft look like it just took off on the very first poll,
+        // firing a false "Positive rate" and never triggering the ground-
+        // roll callouts (which all require onGround == true, never true
+        // again mid-flight).
+        if (!hasBaseline) {
+            hasBaseline = true
+            wasOnGround = onGround
+            lastGearLeverDown = gearDown
+            lastFlapIndex = flapState
+            if (!onGround) {
+                // Starting mid-flight: don't let it later bark ground-roll
+                // callouts if it happens to touch down and roll again.
+                hasCalled80or100 = true
+                hasCalledV1 = true
+                hasCalledVr = true
+                hasCalledPositiveRate = true
+            }
+            return
+        }
 
         val headwind = windSpeed * cos(Math.toRadians(windDir - heading))
 

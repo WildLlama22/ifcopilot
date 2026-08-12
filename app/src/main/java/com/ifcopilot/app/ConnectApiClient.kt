@@ -13,6 +13,16 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+/**
+ * Client for Infinite Flight's "Connect" API v2 (local TCP socket, no API key).
+ *
+ * IMPORTANT CAVEAT: Infinite Flight's official docs describe the message shape
+ * (ID, boolean, value; strings length-prefixed) but do not publish the exact
+ * endianness used on the wire. This implementation assumes little-endian,
+ * matching how the reference .NET sample (BitConverter, little-endian on all
+ * common desktop/mobile CPUs) would naturally serialize values. If values come
+ * back garbled, this is the first thing to flip (see ENDIAN below).
+ */
 object Proto {
     val ENDIAN: ByteOrder = ByteOrder.LITTLE_ENDIAN
 }
@@ -73,6 +83,11 @@ class ConnectApiClient {
     val isConnected: Boolean
         get() = socket?.isConnected == true && socket?.isClosed == false
 
+    /**
+     * Listens for the UDP broadcast Infinite Flight sends on port 15000
+     * advertising its host/port/aircraft. Returns null if nothing heard
+     * within [timeoutMs].
+     */
     suspend fun discover(timeoutMs: Int = 8000): DiscoveredHost? = withContext(Dispatchers.IO) {
         try {
             DatagramSocket(15000).use { udp ->
@@ -90,15 +105,42 @@ class ConnectApiClient {
     }
 
     private fun parseDiscovery(text: String): DiscoveredHost? {
-        return try {
+        // Try the structured field names first (best case).
+        try {
             val json = JSONObject(text)
-            val port = json.optInt("Port", 10112)
-            val addresses = json.optJSONArray("Addresses")
-            val addr = if (addresses != null && addresses.length() > 0) addresses.getString(0) else null
-            DiscoveredHost(addr ?: "", port, json.optString("Aircraft", ""), json.optString("DeviceName", ""))
+            val port = json.optInt("Port", json.optInt("port", 10112))
+            val addr = extractFirstAddress(json)
+            if (!addr.isNullOrBlank()) {
+                return DiscoveredHost(
+                    addr, port,
+                    json.optString("Aircraft", json.optString("aircraft", "")),
+                    json.optString("DeviceName", json.optString("deviceName", ""))
+                )
+            }
         } catch (e: Exception) {
-            null
+            // fall through to the regex fallback below
         }
+
+        // Fallback: the exact broadcast schema isn't confirmed against real
+        // IF traffic, so if the structured parse above didn't find an
+        // address, scan the raw text directly for an IPv4-looking string
+        // and a port number. Less precise, but doesn't depend on guessing
+        // exact JSON key names correctly.
+        val ipMatch = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}\b""").find(text)?.value
+        val portMatch = Regex(""""?[Pp]ort"?\s*[:=]\s*(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 10112
+        return if (ipMatch != null) DiscoveredHost(ipMatch, portMatch, "", "") else null
+    }
+
+    private fun extractFirstAddress(json: JSONObject): String? {
+        for (key in listOf("Addresses", "addresses")) {
+            val arr = json.optJSONArray(key)
+            if (arr != null && arr.length() > 0) return arr.optString(0)
+        }
+        for (key in listOf("Address", "address", "Ip", "ip", "IpAddress", "ipAddress", "Host", "host")) {
+            val v = json.optString(key, "")
+            if (v.isNotBlank()) return v
+        }
+        return null
     }
 
     suspend fun connect(host: String, port: Int) = withContext(Dispatchers.IO) {
@@ -119,6 +161,7 @@ class ConnectApiClient {
         output = null
     }
 
+    /** Requests the full state manifest and builds path/id lookup maps. */
     private suspend fun fetchManifest() = ioMutex.withLock {
         val out = output ?: return@withLock
         val inp = input ?: return@withLock
@@ -127,7 +170,7 @@ class ConnectApiClient {
         writeBool(out, false)
         out.flush()
 
-        readInt32(inp)
+        val respId = readInt32(inp)
         val length = readInt32(inp)
         val raw = ByteArray(length)
         inp.readFully(raw)
@@ -145,6 +188,11 @@ class ConnectApiClient {
                 val path = parts[2]
                 val type = IfType.fromId(typeId)
                 if (type == null) {
+                    // Unrecognized type code for this manifest line - skip it
+                    // rather than crash the whole connection. Common cause:
+                    // IF added a type this client doesn't model yet (e.g. an
+                    // array/vector type). Anything using this exact path
+                    // simply won't be readable until the mapping is extended.
                     skippedUnknownTypes++
                     return@forEach
                 }
@@ -158,7 +206,23 @@ class ConnectApiClient {
         lastSkippedUnknownTypeCount = skippedUnknownTypes
     }
 
+    /** Look up a manifest entry by its stable path string, e.g. "aircraft/0/altitude_agl" */
     fun resolve(path: String): ManifestEntry? = manifestByPath[path]
+
+    /**
+     * Fallback lookup for when the exact path name isn't confirmed - scans
+     * all manifest paths for one containing every given keyword
+     * (case-insensitive). Useful for things like the throttle state, where
+     * the exact path string used by this client is a best guess, not
+     * something verified against Infinite Flight's real manifest.
+     */
+    fun resolveFuzzy(vararg keywords: String): ManifestEntry? {
+        val lowerKeywords = keywords.map { it.lowercase() }
+        return manifestByPath.entries.firstOrNull { (path, _) ->
+            val lowerPath = path.lowercase()
+            lowerKeywords.all { lowerPath.contains(it) }
+        }?.value
+    }
 
     suspend fun getState(entry: ManifestEntry): IfValue? = ioMutex.withLock {
         val out = output ?: return@withLock null
@@ -193,12 +257,15 @@ class ConnectApiClient {
         out.flush()
     }
 
+    /** Runs a command entry (e.g. Commands.FlapsDown) - fire and forget. */
     suspend fun runCommand(entry: ManifestEntry) = ioMutex.withLock {
         val out = output ?: return@withLock
         writeInt32(out, entry.id)
         writeBool(out, false)
         out.flush()
     }
+
+    // ---- low level read/write helpers ----
 
     private fun writeInt32(out: DataOutputStream, v: Int) {
         val bb = ByteBuffer.allocate(4).order(Proto.ENDIAN).putInt(v)
@@ -221,7 +288,8 @@ class ConnectApiClient {
     }
 
     private fun readValue(inp: DataInputStream, expectedType: IfType): IfValue {
-        readInt32(inp)
+        // Every response begins with id (int32) + length (int32) of the payload.
+        readInt32(inp) // id (echoed back), unused here
         val length = readInt32(inp)
         val payload = ByteArray(length)
         inp.readFully(payload)
@@ -233,10 +301,13 @@ class ConnectApiClient {
             IfType.DOUBLE -> IfValue.D(bb.double)
             IfType.LONG -> IfValue.L(bb.long)
             IfType.STRING -> {
-                val strLen = bb.int
-                val strBytes = ByteArray(strLen)
-                bb.get(strBytes)
-                IfValue.S(String(strBytes, Charsets.UTF_8))
+                // NOTE: earlier versions assumed an extra 4-byte length
+                // prefix inside the payload itself, on top of the outer
+                // length IF already sends. That was wrong and caused
+                // BufferUnderflowException (message == null) on any string
+                // read, e.g. aircraft/0/name - the outer length already
+                // *is* the string's byte length, so just decode it directly.
+                IfValue.S(String(payload, Charsets.UTF_8))
             }
         }
     }

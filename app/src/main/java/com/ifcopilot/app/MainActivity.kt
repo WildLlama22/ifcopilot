@@ -129,11 +129,20 @@ fun CopilotScreen() {
                                 statusText = "Connecting..."
                                 FlightMonitorService.client.connect(hostInput, portInput.toIntOrNull() ?: 10112)
                                 statusText = "Connected. Resolving aircraft..."
-                                val nameEntry = FlightMonitorService.client.resolve("aircraft/0/name")
-                                val name = nameEntry?.let { FlightMonitorService.client.getState(it)?.asString() } ?: ""
+                                val skipped = FlightMonitorService.client.lastSkippedUnknownTypeCount
+                                var name = ""
+                                try {
+                                    val nameEntry = FlightMonitorService.client.resolve("aircraft/0/name")
+                                    name = nameEntry?.let { FlightMonitorService.client.getState(it)?.asString() } ?: ""
+                                } catch (e: Exception) {
+                                    // Don't let a single field's read failure undo an
+                                    // otherwise-successful connection - fall back to the
+                                    // generic profile and keep going.
+                                }
                                 selectedProfile = AircraftProfiles.matchByName(name)
                                 FlightMonitorService.currentProfile = selectedProfile
-                                statusText = "Connected — detected: ${name.ifBlank { "unknown" }} → using ${selectedProfile.displayName} profile"
+                                val skippedNote = if (skipped > 0) " ($skipped manifest entries had an unrecognized type and were skipped)" else ""
+                                statusText = "Connected — detected: ${name.ifBlank { "unknown" }} → using ${selectedProfile.displayName} profile$skippedNote"
                             } catch (e: Exception) {
                                 statusText = "Connection failed: ${e.message}"
                             }
@@ -186,14 +195,19 @@ fun CopilotScreen() {
             ) {
                 Text("TOGA", fontWeight = FontWeight.Bold)
                 Text("Ramps throttle smoothly to 95% over 3 seconds.", fontSize = 12.sp)
+                var togaError by remember { mutableStateOf<String?>(null) }
                 Button(
                     onClick = {
                         togaEngaged = true
+                        togaError = null
                         FlightMonitorService.toga?.engage(
                             scope = CoroutineScope(Dispatchers.IO),
                             targetFraction = 0.95f,
                             durationMs = 3000L,
-                            onDone = { togaEngaged = false }
+                            onDone = {
+                                togaEngaged = false
+                                togaError = FlightMonitorService.lastTogaError
+                            }
                         )
                     },
                     modifier = Modifier.fillMaxWidth().height(64.dp),
@@ -201,6 +215,7 @@ fun CopilotScreen() {
                 ) {
                     Text(if (togaEngaged) "TOGA ENGAGED..." else "TOGA", fontSize = 20.sp)
                 }
+                togaError?.let { Text(it, fontSize = 12.sp, color = androidx.compose.ui.graphics.Color.Red) }
             }
         }
 
